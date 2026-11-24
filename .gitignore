@@ -7,13 +7,3 @@ obj/
 __pycache__/
 *.pyc
 .env
-
-# Docker files (written by hand while learning)
-Dockerfile
-Dockerfile.*
-*.Dockerfile
-.dockerignore
-docker-compose*.yml
-docker-compose*.yaml
-compose*.yml
-compose*.yaml

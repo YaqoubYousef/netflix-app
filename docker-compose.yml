@@ -1,0 +1,213 @@
+name: netflix
+
+# Shared settings (values come from .env, with local-dev defaults)
+x-jwt: &jwt
+  JWT_SECRET: ${JWT_SECRET:-change-me-this-is-a-dev-secret-at-least-32-bytes}
+
+x-pg-health: &pg-health
+  test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+  interval: 5s
+  timeout: 3s
+  retries: 20
+
+services:
+  # ======================= infrastructure =======================
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-netflix}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-netflix}
+    ports:
+      - "15672:15672"          # management UI
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  minio:
+    image: pgsty/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9001:9001"            # MinIO console
+    volumes:
+      - minio-data:/data
+    networks: [backend, frontend]   # gateway proxies /netflix-media/ to it
+    restart: unless-stopped
+
+  auth-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: authdb, POSTGRES_USER: auth, POSTGRES_PASSWORD: auth }
+    volumes: [auth-db-data:/var/lib/postgresql/data]
+    networks: [backend]
+    healthcheck: *pg-health
+    restart: unless-stopped
+
+  media-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: mediadb, POSTGRES_USER: media, POSTGRES_PASSWORD: media }
+    volumes: [media-db-data:/var/lib/postgresql/data]
+    networks: [backend]
+    healthcheck: *pg-health
+    restart: unless-stopped
+
+  watchlist-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: watchlistdb, POSTGRES_USER: watchlist, POSTGRES_PASSWORD: watchlist }
+    volumes: [watchlist-db-data:/var/lib/postgresql/data]
+    networks: [backend]
+    healthcheck: *pg-health
+    restart: unless-stopped
+
+  catalog-db:
+    image: mongo:7
+    volumes: [catalog-db-data:/data/db]
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ======================= microservices =======================
+  auth-service:
+    build: ./services/auth-service
+    image: netflix/auth-service
+    environment:
+      <<: *jwt
+      DB_URL: jdbc:postgresql://auth-db:5432/authdb
+      DB_USER: auth
+      DB_PASSWORD: auth
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: ${RABBITMQ_USER:-netflix}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-netflix}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+    depends_on:
+      auth-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    networks: [backend, frontend]
+    restart: unless-stopped
+
+  catalog-service:
+    build: ./services/catalog-service
+    image: netflix/catalog-service
+    environment:
+      <<: *jwt
+      MONGO_URL: mongodb://catalog-db:27017/catalogdb
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-netflix}:${RABBITMQ_PASSWORD:-netflix}@rabbitmq:5672
+    depends_on:
+      catalog-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    networks: [backend, frontend]
+    restart: unless-stopped
+
+  media-service:
+    build: ./services/media-service
+    image: netflix/media-service
+    environment: &media-env
+      <<: *jwt
+      DB_HOST: media-db
+      DB_NAME: mediadb
+      DB_USER: media
+      DB_PASSWORD: media
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: netflix-media
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-netflix}:${RABBITMQ_PASSWORD:-netflix}@rabbitmq:5672/%2F
+    depends_on:
+      media-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      minio: { condition: service_started }
+    networks: [backend, frontend]
+    restart: unless-stopped
+
+  # Same image as media-service, different process
+  media-worker:
+    image: netflix/media-service
+    command: ["python", "manage.py", "consume_events"]
+    environment: *media-env
+    healthcheck: { disable: true }
+    depends_on:
+      media-service: { condition: service_healthy }   # migrations + bucket done
+    networks: [backend]
+    restart: unless-stopped
+
+  watchlist-service:
+    build: ./services/watchlist-service
+    image: netflix/watchlist-service
+    environment:
+      ConnectionStrings__Default: Host=watchlist-db;Port=5432;Database=watchlistdb;Username=watchlist;Password=watchlist
+      Jwt__Secret: ${JWT_SECRET:-change-me-this-is-a-dev-secret-at-least-32-bytes}
+      RabbitMq__Host: rabbitmq
+      RabbitMq__User: ${RABBITMQ_USER:-netflix}
+      RabbitMq__Password: ${RABBITMQ_PASSWORD:-netflix}
+    depends_on:
+      watchlist-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    networks: [backend, frontend]
+    restart: unless-stopped
+
+  # ======================= micro-frontends =======================
+  shell:
+    build: ./frontends/shell
+    image: netflix/shell
+    networks: [frontend]
+    restart: unless-stopped
+
+  mfe-auth:
+    build: ./frontends/mfe-auth
+    image: netflix/mfe-auth
+    networks: [frontend]
+    restart: unless-stopped
+
+  mfe-browse:
+    build: ./frontends/mfe-browse
+    image: netflix/mfe-browse
+    networks: [frontend]
+    restart: unless-stopped
+
+  studio:
+    build: ./frontends/studio
+    image: netflix/studio
+    networks: [frontend]
+    restart: unless-stopped
+
+  # ======================= entry point =======================
+  gateway:
+    build: ./gateway
+    image: netflix/gateway
+    ports:
+      - "8080:80"
+    depends_on:
+      - shell
+      - mfe-auth
+      - mfe-browse
+      - studio
+      - auth-service
+      - catalog-service
+      - media-service
+      - watchlist-service
+    networks: [frontend]
+    restart: unless-stopped
+
+networks:
+  frontend:
+  backend:
+
+volumes:
+  rabbitmq-data:
+  minio-data:
+  auth-db-data:
+  media-db-data:
+  watchlist-db-data:
+  catalog-db-data:
